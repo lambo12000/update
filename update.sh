@@ -2,10 +2,10 @@
 # Update apt packages, then refresh snaps, with a bit of flair.
 set -euo pipefail
 
-# Colours follow the terminal's theme. With ACCENT=auto the accent is chosen the
+# Colors follow the terminal's theme. With ACCENT=auto the accent is chosen the
 # same way Ptyxis tints its own window: the palette's blue, or your desktop accent
-# colour (Settings > Appearance) for palettes that use it, such as Ubuntu and GNOME.
-# Or force one of the theme's colours: 1 red, 2 green, 3 yellow, 4 blue, 5 magenta, 6 cyan.
+# color (Settings > Appearance) for palettes that use it, such as Ubuntu and GNOME.
+# Or force one of the theme's colors: 1 red, 2 green, 3 yellow, 4 blue, 5 magenta, 6 cyan.
 ACCENT=auto
 
 # Prints the desktop accent as "R;G;B" if the current Ptyxis palette follows it.
@@ -59,16 +59,16 @@ if [[ -t 1 ]]; then
     FANCY=1
     RESET=$'\e[0m' BOLD=$'\e[1m' DIM=$'\e[2m'
     RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m'
-    if [[ $ACCENT == *';'* ]]; then     # an exact colour from the desktop accent
+    if [[ $ACCENT == *';'* ]]; then     # an exact color from the desktop accent
         THEME=$'\e[0;38;2;'"${ACCENT}m"
         BRIGHT=$'\e[0;38;2;'"$(lighten "$ACCENT")m"
-    else                                # one of the terminal palette's colours
+    else                                # one of the terminal palette's colors
         THEME=$'\e[0;3'"${ACCENT}m"
         BRIGHT=$'\e[0;9'"${ACCENT}m"
     fi
-    SHADOW=$'\e[0;2m'                   # faded text colour: grey on any background
-    # Highlight that sweeps across the banner, centre → edge:
-    # bold text colour, plain text colour, then a brighter accent.
+    SHADOW=$'\e[0;2m'                   # faded text color: gray on any background
+    # Highlight that sweeps across the banner, center → edge:
+    # bold text color, plain text color, then a brighter accent.
     SHINE=($'\e[0;1m' $'\e[0m' "$BRIGHT")
 else
     FANCY=0
@@ -128,7 +128,7 @@ split_banner() {
     done
 }
 
-# banner_cells <row> <from> <to> <column>: colours that row's characters from
+# banner_cells <row> <from> <to> <column>: colors that row's characters from
 # <from> to <to>, with a slanted highlight at <column>, and appends them to $out.
 banner_cells() {
     local row=$1 from=$2 to=$3 pos=$4 width=${#BANNER[0]} i d ch color prev=""
