@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Update apt packages, then refresh snaps, with a bit of flair.
+# Update everything on this machine (apt or dnf packages, snaps, Flatpak apps and
+# Homebrew), with a bit of flair.
 set -euo pipefail
 
 # Colors follow the terminal's theme. With ACCENT=auto the accent is chosen the
@@ -14,8 +15,11 @@ desktop_accent() {
     if [[ -z ${PTYXIS_PROFILE:-} ]]; then return 0; fi
     palette=$(gsettings get "org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/$PTYXIS_PROFILE/" palette 2>/dev/null) || return 0
     palette=${palette//\'/}
+    # Fedora doesn't install gresource, so the built-in palettes can't be read
+    # there; these are the ones that follow the accent (gnome is Fedora's default).
     { cat ~/.local/share/org.gnome.Ptyxis/palettes/"$palette".palette 2>/dev/null ||
-        gresource extract "$(command -v ptyxis)" "/org/gnome/Ptyxis/palettes/$palette.palette" 2>/dev/null; } |
+        gresource extract "$(command -v ptyxis)" "/org/gnome/Ptyxis/palettes/$palette.palette" 2>/dev/null ||
+        case $palette in gnome|gnome-high-contrast|'GNOME Legacy') echo 'UseSystemAccent=true' ;; esac; } |
         grep -ix 'UseSystemAccent=true' >/dev/null || return 0
     # The same shades libadwaita uses for each accent.
     case $(gsettings get org.gnome.desktop.interface accent-color 2>/dev/null) in
@@ -40,12 +44,21 @@ fi
 ACCENT=${UPDATE_ACCENT:-$ACCENT}
 if [[ -z $ACCENT || $ACCENT == auto ]]; then ACCENT=4; fi
 
+# Your own Flatpak apps belong to you rather than root, so they're updated as
+# you: the user who started this with sudo.
+USER_NAME=${SUDO_USER:-}
+USER_HOME=""
+if [[ -n $USER_NAME && $USER_NAME != root ]]; then
+    USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6 || true)
+fi
+
 # Output is hidden behind a spinner, so apt must never stop and wait for input.
 # If you've edited a package's config file, your version is kept.
 export DEBIAN_FRONTEND=noninteractive
 
-# Make bash count multi-byte characters (the banner art) correctly.
-LC_CTYPE=C.UTF-8
+# Each step's output is read to sum up what it did, so ask for it in English.
+# UTF-8 also makes bash count the banner's characters correctly.
+export LC_ALL=C.UTF-8
 
 # Lighten "R;G;B" 40% of the way towards white.
 lighten() {
@@ -88,6 +101,10 @@ BANNER=(
 LOG_DIR=$(mktemp -d /tmp/update.XXXXXX)
 STEP=0
 CHILD=""
+INTRO_SHOWN=0
+INTERRUPTED=0
+WIDE_WARNINGS=0
+BREW_REJECTED=""
 
 # The animations run alongside the update, so they avoid starting new processes
 # (each one costs several milliseconds of CPU) and use bash built-ins instead.
@@ -95,18 +112,69 @@ CHILD=""
 # A pipe that never gets any data: reading it with a timeout is a sleep that
 # doesn't need to start a `sleep` process each time.
 exec {NAP_FD}<> <(:)
-nap() { read -r -t "$1" -u "$NAP_FD" || true; }
+nap() {
+    read -r -t "$1" -u "$NAP_FD" || true
+    check_interrupt
+}
 
 cleanup() {
     if (( FANCY )); then printf '\e[?25h'; fi   # bring the cursor back
 }
 
-on_interrupt() {
+# stop_tree <pid>: stops a process and what it started. Package managers are
+# only asked to stop, and left to stop their own work: dnf finishes the
+# transaction it's in, and apt the dpkg run it's in, setup scripts and kernel
+# installs included. Anything else (Homebrew, in its own session where Ctrl+C
+# can't reach it, or a wrapper like dbus-run-session) is stopped along with
+# everything it started. runuser ends by itself once the command it runs does (if
+# signaled, it would force-kill that command after 2s), and tee once its input ends.
+stop_tree() {
+    local child
+    case $(ps -o comm= -p "$1" 2>/dev/null) in
+        apt-get)
+            # apt's way of being asked to stop is Ctrl+C, which it only handles
+            # while dpkg is installing; at any other time, TERM is safe.
+            if catches_ctrl_c "$1"; then kill -INT "$1" 2>/dev/null || true
+            else kill "$1" 2>/dev/null || true; fi
+            return ;;
+        dpkg|dnf|dnf5|dnf-3|rpm-ostree|snap|flatpak) kill "$1" 2>/dev/null || true; return ;;
+        runuser) for child in $(pgrep -P "$1" || true); do stop_tree "$child"; done; return ;;
+        tee) return ;;
+    esac
+    for child in $(pgrep -P "$1" || true); do stop_tree "$child"; done
+    kill "$1" 2>/dev/null || true
+}
+
+# catches_ctrl_c <pid>: is that process handling SIGINT right now?
+catches_ctrl_c() {
+    local key value
+    while read -r key value; do
+        if [[ $key == SigCgt: ]]; then (( 16#$value & 2 )); return; fi
+    done 2>/dev/null < "/proc/$1/status"
+    return 1
+}
+
+# Ctrl+C (or TERM) is only noted here. Bash can cut a signal handler short when
+# a background step finishes while it runs, so the actual stopping is done by
+# check_interrupt, which runs between spinner frames and between steps.
+on_interrupt() { INTERRUPTED=1; }
+
+check_interrupt() {
+    if (( ! INTERRUPTED )); then return 0; fi
+    trap '' INT TERM   # a second Ctrl+C mustn't interrupt the cleanup
+    printf '\n\n  %sInterrupted.%s' "$RED" "$RESET"
     if [[ -n $CHILD ]]; then
-        pkill -P "$CHILD" 2>/dev/null || true   # the running command
-        kill "$CHILD" 2>/dev/null || true       # and the wrapper around it
+        # CHILD is this script's own subshell for the step: stop what it's running,
+        # and the subshell ends once that has, so waiting for it waits for the step.
+        local child
+        if kill -0 "$CHILD" 2>/dev/null; then printf ' Letting the current step stop safely...'; fi
+        # Without the spinner, the step's last output follows on screen: give it its own lines.
+        if (( ! FANCY )); then printf '\n'; fi
+        for child in $(pgrep -P "$CHILD" || true); do stop_tree "$child"; done
+        wait "$CHILD" 2>/dev/null || true
     fi
-    printf '\n\n  %sInterrupted.%s Logs are in %s\n' "$RED" "$RESET" "$LOG_DIR"
+    if (( FANCY )); then printf ' '; else printf '\n  '; fi
+    printf 'Logs are in %s\n' "$LOG_DIR"
     exit 130
 }
 
@@ -203,6 +271,7 @@ detail() {
 # Starts the command with its full output going to $LAST_LOG. With the spinner on,
 # it runs in the background so the intro can play while it works.
 start_step() {
+    check_interrupt
     STEP_LABEL=$1; shift
     STEP_START=$SECONDS
     STEP=$(( STEP + 1 ))
@@ -217,12 +286,19 @@ start_step() {
         CHILD=$!
         exec {LOG_FD}<"$LAST_LOG"
         STEP_STATUS=""
-        STEP_WIDTH=$(( $(tput cols 2>/dev/null || echo 80) - 40 ))
+        STEP_WIDTH=$(tput cols 2>/dev/null) || STEP_WIDTH=80
+        STEP_WIDTH=$(( STEP_WIDTH - 40 ))
         STEP_WIDTH=$(( STEP_WIDTH > 0 ? STEP_WIDTH : 0 ))
     else
         printf '==> %s\n' "$STEP_LABEL"
+        # In the background too, so that waiting for it can be cut short by Ctrl+C.
+        # (Its own stderr is hidden only to keep bash's job notices out of the way.)
+        ( set +e; "$@" </dev/null 2>&1 | tee "$LAST_LOG"; exit "${PIPESTATUS[0]}" ) 2>/dev/null &
+        CHILD=$!
         STEP_STATUS=0
-        "$@" </dev/null 2>&1 | tee "$LAST_LOG" || STEP_STATUS=$?
+        wait "$CHILD" || STEP_STATUS=$?
+        check_interrupt
+        CHILD=""
     fi
 }
 
@@ -233,11 +309,17 @@ finish_step() {
 
     if (( FANCY )); then
         while :; do
-            # Catch up on new output, keeping the last full line and any warnings
-            # (apt reports problems on "W:" / "E:" lines).
+            # Catch up on new output, keeping the last full line and any warnings.
+            # apt says "W:" or "E:". Flatpak and Homebrew say "Warning:", and
+            # Flatpak "Unable to update" for apps it had to skip; those are only
+            # shown for their steps (WIDE_WARNINGS=1), as package setup scripts
+            # print routine "Warning:" lines during apt and dnf upgrades.
             while IFS= read -r -u "$LOG_FD" chunk; do
                 line=$partial$chunk partial=""
-                if [[ $line == [WE]:\ * ]]; then STEP_WARNINGS+=("$line"); fi
+                if [[ $line == [WE]:\ * ]] ||
+                    { (( WIDE_WARNINGS )) && [[ $line == Warning:\ * || $line == "Unable to update "* ]]; }; then
+                    STEP_WARNINGS+=("$line")
+                fi
             done
             partial+=$chunk
             if [[ -n $STEP_STATUS ]]; then break; fi
@@ -254,6 +336,7 @@ finish_step() {
             IFS= read -r -t 0.08 -u "$DONE_FD" STEP_STATUS || {
                 if (( $? <= 128 )); then STEP_STATUS=1; fi   # closed without a status
             }
+            check_interrupt
         done
         exec {DONE_FD}<&- {LOG_FD}<&-
         CHILD=""
@@ -275,31 +358,243 @@ finish_step() {
     done
 }
 
+# The intro plays once, before anything else is shown.
+show_intro() {
+    if (( FANCY && ! INTRO_SHOWN )); then
+        INTRO_SHOWN=1
+        printf '\e[?25l'   # hide the cursor while animating
+        intro
+    fi
+}
+
 run_step() {
     start_step "$@"
+    show_intro   # the first step to run carries on in the background meanwhile
     finish_step
+}
+
+# skipped "Label" "reason": notes a step that didn't run, and why.
+skipped() {
+    show_intro
+    printf '  %s- %-26s skipped, %s%s\n' "$DIM" "$1" "$2" "$RESET"
+}
+
+# have <command>: is this command installed?
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# as_user command [args...]: runs a command as you instead of root, in a clean
+# environment, for things that belong to you.
+as_user() {
+    runuser -u "$USER_NAME" -- env -i HOME="$USER_HOME" USER="$USER_NAME" LOGNAME="$USER_NAME" \
+        SHELL=/bin/bash LC_ALL=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin "$@"
+}
+
+# dnf5 buffers what it writes to a file, which can split its summary lines up in
+# the log; stdbuf makes it write whole lines as it goes.
+line_buffered() {
+    if have stdbuf; then stdbuf -oL "$@"; else "$@"; fi
+}
+
+# Fedora Atomic desktops (Silverblue and friends) update a whole system image,
+# which takes over at the next boot. rpm-ostree exits 77 when there's nothing new.
+upgrade_system_image() {
+    local status=0
+    rpm-ostree upgrade --unchanged-exit-77 || status=$?
+    case $status in
+        77) echo "Already up to date" ;;
+        0)  echo "New system image ready; it starts after a reboot" ;;
+        *)  return "$status" ;;
+    esac
+}
+
+# dnf5 says " Upgrading:  12 packages" and dnf4 "Upgrade  12 Packages". Updates
+# dnf had to hold back (broken dependencies, conflicts) are listed under
+# "Skipping packages with ..." and counted as Skipping/Skip.
+dnf_summary() {
+    awk '
+        /^ ?(Upgrading:|Upgrade) +[0-9]+ [Pp]ackages? *$/  { upgraded = $2 }
+        /^ ?(Installing:|Install) +[0-9]+ [Pp]ackages? *$/ { added = $2 }
+        /^ ?(Removing:|Remove) +[0-9]+ [Pp]ackages? *$/    { removed = $2 }
+        /^ ?(Skipping:|Skip) +[0-9]+ [Pp]ackages? *$/      { skipped = $2 }
+        /^Skipping packages with /                         { held = 1 }
+        END {
+            if (upgraded + added + removed == 0) out = "Nothing new to install"
+            else out = sprintf("%d upgraded, %d newly installed, %d removed", upgraded, added, removed)
+            if (skipped > 0) out = out sprintf("; %d held back", skipped)
+            else if (held) out = out "; some updates held back"
+            else if (upgraded + added + removed == 0) out = "Already up to date"
+            print out
+        }
+    ' "$1"
+}
+
+# Flatpak needs a D-Bus session for some updates (Fedora's own Flatpak remote
+# always does), and there's none under sudo, so give it a private one when
+# possible. Otherwise hide the desktop's DISPLAY so it doesn't try to start one there.
+# Flatpak removes runtimes that reached end of life once no app installed for
+# everyone uses them; running as root, it can't see your own apps. With no apps
+# installed for everyone, only runtimes, those are there for your apps, so
+# `--no-deps` keeps them. Otherwise one your apps still use is installed again
+# for you when your apps are updated.
+update_flatpak_system() {
+    local args=(update --system --noninteractive)
+    if ! compgen -G '/var/lib/flatpak/app/*' >/dev/null; then args+=(--no-deps); fi
+    if have dbus-run-session; then
+        dbus-run-session -- flatpak "${args[@]}"
+    else
+        env -u DISPLAY -u XAUTHORITY flatpak "${args[@]}"
+    fi
+}
+
+# Your own Flatpak apps are updated as you, through your desktop's D-Bus session
+# if you're logged in, or a private one otherwise.
+update_flatpak_user() {
+    local uid
+    uid=$(id -u "$USER_NAME")
+    if [[ -S /run/user/$uid/bus ]]; then
+        as_user env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            flatpak update --user --noninteractive
+    elif have dbus-run-session; then
+        as_user dbus-run-session -- flatpak update --user --noninteractive
+    else
+        as_user flatpak update --user --noninteractive
+    fi
+}
+
+# Flatpak prints one "Updating app/..." (or runtime/...) line per change.
+flatpak_summary() {
+    awk '
+        /^Updating (app|runtime)\//     { updated++ }
+        /^Installing (app|runtime)\//   { added++ }
+        /^Uninstalling (app|runtime)\// { removed++ }
+        END {
+            if (updated + added + removed == 0) print "Already up to date"
+            else printf "%d updated, %d newly installed, %d removed\n", updated, added, removed
+        }
+    ' "$1"
+}
+
+# Homebrew lives in /home/linuxbrew/.linuxbrew (or ~/.linuxbrew on old installs).
+# Sets BREW, plus BREW_OWNER and BREW_HOME: whoever owns that folder, which is who
+# brew must run as. It's never run as root, not even to ask where it lives.
+# The folder is resolved once, and the one it sits in must belong to root or the
+# same owner, so nobody else can swap in a different Homebrew. One in your home
+# folder must also be yours.
+# If a Homebrew is found but turned down, BREW_REJECTED says why.
+find_brew() {
+    local candidate prefix parent parent_owner
+    for candidate in /home/linuxbrew/.linuxbrew ${USER_HOME:+"$USER_HOME/.linuxbrew"}; do
+        prefix=$(realpath -e -- "$candidate" 2>/dev/null) || continue
+        if [[ ! -x $prefix/bin/brew ]]; then continue; fi
+        BREW_OWNER=$(stat -c %U -- "$prefix")
+        parent=${prefix%/*}
+        parent_owner=$(stat -c %U -- "${parent:-/}")
+        if [[ -n $USER_HOME && $candidate == "$USER_HOME"/* && $BREW_OWNER != "$USER_NAME" ]]; then
+            BREW_REJECTED="the one in your home folder isn't yours"; continue
+        fi
+        if [[ $parent_owner != root && $parent_owner != "$BREW_OWNER" ]]; then
+            BREW_REJECTED="the folder it's in belongs to someone else"; continue
+        fi
+        BREW_HOME=$(getent passwd "$BREW_OWNER" | cut -d: -f6 || true)
+        if [[ $BREW_OWNER == root || -z $BREW_HOME ]]; then
+            BREW_REJECTED="its folder doesn't belong to a regular user"; continue
+        fi
+        BREW=$prefix/bin/brew
+        return 0
+    done
+    return 1
+}
+
+# as_brew_owner <brew command>: runs brew as its owner, in a clean environment,
+# from their home folder. setsid detaches it from the terminal, so anything that
+# asks for a sudo password fails instead of waiting behind the spinner.
+as_brew_owner() {
+    # The single quotes are deliberate: $HOME and $@ belong to the inner shell.
+    # shellcheck disable=SC2016
+    setsid -w runuser -u "$BREW_OWNER" -- env -i HOME="$BREW_HOME" USER="$BREW_OWNER" LOGNAME="$BREW_OWNER" \
+        PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C.UTF-8 \
+        HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ASK=1 HOMEBREW_NO_SUDO=1 \
+        HOMEBREW_NO_COLOR=1 HOMEBREW_NO_EMOJI=1 \
+        bash -c 'cd -- "$HOME" && exec "$@"' -- "$BREW" "$@"
+}
+
+# brew prints "==> Upgrading <name>" for each package it upgrades.
+brew_summary() {
+    awk '
+        /^==> Upgrading [^ ]+$/ { names = names sep $3; sep = ", " }
+        END { print (names == "" ? "Already up to date" : "Upgraded: " names) }
+    ' "$1"
+}
+
+# rpm-based systems have no reboot-required file. Like `dnf needs-restarting`,
+# a reboot is needed if a core package (dnf's list) was installed since boot.
+rpm_needs_reboot() {
+    local boot=0 key value installed
+    while read -r key value _; do
+        if [[ $key == btime ]]; then boot=$value; fi
+    done < /proc/stat
+    for installed in $(rpm -q --qf '%{INSTALLTIME}\n' kernel kernel-core kernel-PAE kernel-rt kernel-smp \
+            kernel-xen linux-firmware microcode_ctl dbus glibc hal systemd udev gnutls openssl-libs \
+            dbus-broker dbus-daemon 2>/dev/null || true); do
+        if [[ $installed =~ ^[0-9]+$ ]] && (( installed > boot )); then return 0; fi
+    done
+    return 1
+}
+
+reboot_needed() {
+    if [[ -f /var/run/reboot-required || -e /run/ostree/staged-deployment ]]; then return 0; fi
+    have rpm && have dnf && rpm_needs_reboot
 }
 
 TOTAL_START=$SECONDS
 
-start_step "Refreshing package lists" apt-get update
-if (( FANCY )); then
-    printf '\e[?25l'   # hide the cursor while animating
-    intro              # plays while the package lists download
-fi
-finish_step
-
-run_step "Upgrading packages" apt-get -y \
-    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
-summary=$(grep -m1 -E '^[0-9]+ upgraded' "$LAST_LOG" || true)
-detail "${summary%.}"
-
-run_step "Refreshing snaps" snap refresh
-refreshed=$(awk '/ refreshed$/ { printf "%s%s", sep, $1; sep = ", " }' "$LAST_LOG")
-if [[ -n $refreshed ]]; then
-    detail "Refreshed: $refreshed"
-else
+# The system's own packages.
+if [[ -e /run/ostree-booted ]] && have rpm-ostree; then
+    run_step "Upgrading the system image" upgrade_system_image
     detail "$(tail -n 1 "$LAST_LOG")"
+elif have apt-get && [[ -e /etc/debian_version ]]; then   # Fedora can install apt too
+    run_step "Refreshing package lists" apt-get update
+    run_step "Upgrading packages" apt-get -y \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
+    summary=$(grep -m1 -E '^[0-9]+ upgraded' "$LAST_LOG") || true
+    detail "${summary%.}"
+elif have dnf; then
+    run_step "Refreshing package lists" line_buffered dnf -y makecache --refresh
+    run_step "Upgrading packages" line_buffered dnf -y upgrade
+    detail "$(dnf_summary "$LAST_LOG")"
+else
+    skipped "Upgrading packages" "no supported package manager (apt on Debian or Ubuntu, or dnf)"
+fi
+
+if have snap; then
+    run_step "Refreshing snaps" snap refresh
+    refreshed=$(awk '/ refreshed$/ { printf "%s%s", sep, $1; sep = ", " }' "$LAST_LOG") || true
+    if [[ -n $refreshed ]]; then
+        detail "Refreshed: $refreshed"
+    else
+        detail "$(tail -n 1 "$LAST_LOG")"
+    fi
+fi
+
+# Flatpak apps installed for everyone, then any you installed just for yourself.
+# (Your own apps can run on runtimes installed for everyone, so those count too.)
+if have flatpak; then
+    if compgen -G '/var/lib/flatpak/app/*' >/dev/null || compgen -G '/var/lib/flatpak/runtime/*' >/dev/null; then
+        WIDE_WARNINGS=1 run_step "Updating Flatpak apps" update_flatpak_system
+        detail "$(flatpak_summary "$LAST_LOG")"
+    fi
+    if [[ -n $USER_HOME ]] && compgen -G "$USER_HOME/.local/share/flatpak/app/*" >/dev/null; then
+        WIDE_WARNINGS=1 run_step "Updating your Flatpak apps" update_flatpak_user
+        detail "$(flatpak_summary "$LAST_LOG")"
+    fi
+fi
+
+if find_brew; then
+    WIDE_WARNINGS=1 run_step "Updating Homebrew" as_brew_owner update
+    WIDE_WARNINGS=1 run_step "Upgrading brew packages" as_brew_owner upgrade
+    detail "$(brew_summary "$LAST_LOG")"
+elif [[ -n $BREW_REJECTED ]]; then
+    skipped "Updating Homebrew" "$BREW_REJECTED"
 fi
 
 # Restarts Tailscale, then waits until it's connected again and prints its IP.
@@ -315,12 +610,13 @@ restart_tailscale() {
 if systemctl is-active --quiet tailscaled; then
     run_step "Restarting Tailscale" restart_tailscale
     detail "Connected again as $(tail -n 1 "$LAST_LOG")"
-elif command -v tailscale >/dev/null; then
-    printf "  %s- %-26s skipped, it isn't running%s\n" "$DIM" "Restarting Tailscale" "$RESET"
+elif have tailscale; then
+    skipped "Restarting Tailscale" "it isn't running"
 fi
+check_interrupt
 
 echo
-if [[ -f /var/run/reboot-required ]]; then
+if reboot_needed; then
     printf '  %s! A reboot is required to finish the update.%s\n' "$YELLOW" "$RESET"
 fi
 elapsed total "$TOTAL_START"
