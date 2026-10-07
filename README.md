@@ -44,14 +44,14 @@ reboot is needed.
 The animation is written to stay out of the way: the spinner doesn't start any
 new processes, and the intro plays while the package lists download.
 
-## Colours
+## Colors
 
-All colours come from your terminal's theme, so they follow it, light or dark.
+All colors come from your terminal's theme, so they follow it, light or dark.
 The accent defaults to your theme's blue. In [Ptyxis](https://gitlab.gnome.org/chergert/ptyxis),
 with a palette that follows the desktop accent (such as Ubuntu or GNOME), it uses
-your accent colour from Settings > Appearance, as Ptyxis does.
+your accent color from Settings > Appearance, as Ptyxis does.
 
-To pick a colour yourself, set `ACCENT` near the top of the script to one of
+To pick a color yourself, set `ACCENT` near the top of the script to one of
 1 red, 2 green, 3 yellow, 4 blue, 5 magenta or 6 cyan.
 
 ## Requirements
