@@ -9,6 +9,11 @@ set -euo pipefail
 # Or force one of the theme's colors: 1 red, 2 green, 3 yellow, 4 blue, 5 magenta, 6 cyan.
 ACCENT=auto
 
+# Fedora, Fedora Atomic and other dnf systems: when the update needs a restart to
+# finish, ask whether to restart now, waiting this many seconds for an answer. No
+# answer means no. 0 turns the question off.
+RESTART_COUNTDOWN=30
+
 # Prints the desktop accent as "R;G;B" if the current Ptyxis palette follows it.
 desktop_accent() {
     local palette
@@ -105,6 +110,7 @@ INTRO_SHOWN=0
 INTERRUPTED=0
 WIDE_WARNINGS=0
 BREW_REJECTED=""
+FEDORA=0
 
 # The animations run alongside the update, so they avoid starting new processes
 # (each one costs several milliseconds of CPU) and use bash built-ins instead.
@@ -541,6 +547,39 @@ rpm_needs_reboot() {
     return 1
 }
 
+# ask_restart: asks whether to restart, counting down from RESTART_COUNTDOWN.
+# Only y or Y followed by Enter means yes, so a command you're already typing for
+# your shell can't answer it by accident. Anything else, Ctrl+C, or no answer
+# before the countdown ends means no. What you type is shown after the question.
+ask_restart() {
+    local deadline=$(( SECONDS + RESTART_COUNTDOWN )) answer="" key entered=0
+    # Throw away anything typed during the update.
+    while read -r -s -n 1 -t 0.05 _; do :; done
+    printf '\e[?25h'   # show the cursor while waiting for an answer
+    echo
+    while (( SECONDS < deadline && ! INTERRUPTED )); do
+        printf '\r\e[K  %sRestart now?%s [y/N] %s(no in %ds)%s %s' \
+            "$BOLD" "$RESET" "$DIM" $(( deadline - SECONDS )) "$RESET" "$answer"
+        # IFS= keeps a space or tab from being read as an empty key (Enter).
+        IFS= read -r -s -n 1 -t 1 key || {
+            if (( $? > 128 )); then continue; fi   # no key this second
+            break                                  # end of input
+        }
+        case $key in
+            '')            entered=1; break ;;              # Enter
+            $'\x7f'|$'\b') answer=${answer%?} ;;           # Backspace
+            [[:print:]])   answer+=$key ;;
+            *)             answer+='?' ;;                   # Tab, arrows...: not y
+        esac
+    done
+    if (( entered && ! INTERRUPTED )) && [[ $answer == [yY] ]]; then
+        printf '\r\e[K  Restarting...\n'
+        return 0
+    fi
+    printf '\r\e[K  %sNot restarting.%s\n' "$DIM" "$RESET"
+    return 1
+}
+
 reboot_needed() {
     if [[ -f /var/run/reboot-required || -e /run/ostree/staged-deployment ]]; then return 0; fi
     have rpm && have dnf && rpm_needs_reboot
@@ -550,6 +589,7 @@ TOTAL_START=$SECONDS
 
 # The system's own packages.
 if [[ -e /run/ostree-booted ]] && have rpm-ostree; then
+    FEDORA=1
     run_step "Upgrading the system image" upgrade_system_image
     detail "$(tail -n 1 "$LAST_LOG")"
 elif have apt-get && [[ -e /etc/debian_version ]]; then   # Fedora can install apt too
@@ -559,6 +599,7 @@ elif have apt-get && [[ -e /etc/debian_version ]]; then   # Fedora can install a
     summary=$(grep -m1 -E '^[0-9]+ upgraded' "$LAST_LOG") || true
     detail "${summary%.}"
 elif have dnf; then
+    FEDORA=1
     run_step "Refreshing package lists" line_buffered dnf -y makecache --refresh
     run_step "Upgrading packages" line_buffered dnf -y upgrade
     detail "$(dnf_summary "$LAST_LOG")"
@@ -616,7 +657,9 @@ fi
 check_interrupt
 
 echo
+restart_needed=0
 if reboot_needed; then
+    restart_needed=1
     printf '  %s! A reboot is required to finish the update.%s\n' "$YELLOW" "$RESET"
 fi
 elapsed total "$TOTAL_START"
@@ -629,3 +672,11 @@ else
 fi
 
 rm -rf "$LOG_DIR"
+
+# On Fedora, when a restart is needed, offer one (only when someone is at the
+# terminal to answer). Ctrl+C at any point means no.
+if (( FEDORA && restart_needed && RESTART_COUNTDOWN > 0 )) && [[ -t 0 && -t 1 ]] &&
+    ask_restart && (( ! INTERRUPTED )); then
+    systemctl reboot
+fi
+if (( INTERRUPTED )); then exit 130; fi
