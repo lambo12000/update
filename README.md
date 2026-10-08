@@ -42,11 +42,13 @@ It runs whichever of these are installed, in this order:
 5. **Tailscale**: restarted if it's installed **and running**, then the script
    waits for it to reconnect. If you've stopped Tailscale, it's left alone.
 
-On Fedora, when everything is done, it asks whether to shut down, with a
-30-second countdown. Only `y` shuts down; any other key, or no answer before the
-countdown ends, means no. Set `SHUTDOWN_COUNTDOWN` near the top of the script to
-change the countdown, or to `0` to turn the question off. It's only asked when
-the script runs in a terminal.
+On Fedora, Fedora Atomic and other dnf systems, when the update needs a restart
+to finish (see below), it asks whether to restart now, with a 30-second
+countdown. Only `y` (or `Y`) followed by Enter restarts, so a command you're
+already typing can't answer by accident; anything else, Ctrl+C, or no answer
+before the countdown ends means no. Set `RESTART_COUNTDOWN` near the top of the
+script to change the countdown, or to `0` to turn the question off. It's only
+asked when the script runs in a terminal.
 
 It asks for your sudo password once, at the start. At the end it tells you if a
 reboot is needed: on Ubuntu when the system says so, on Fedora Atomic when a new

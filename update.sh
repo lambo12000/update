@@ -9,9 +9,10 @@ set -euo pipefail
 # Or force one of the theme's colors: 1 red, 2 green, 3 yellow, 4 blue, 5 magenta, 6 cyan.
 ACCENT=auto
 
-# Fedora only: when it's done, ask whether to shut down, waiting this many
-# seconds for an answer. No answer means no. 0 turns the question off.
-SHUTDOWN_COUNTDOWN=30
+# Fedora, Fedora Atomic and other dnf systems: when the update needs a restart to
+# finish, ask whether to restart now, waiting this many seconds for an answer. No
+# answer means no. 0 turns the question off.
+RESTART_COUNTDOWN=30
 
 # Prints the desktop accent as "R;G;B" if the current Ptyxis palette follows it.
 desktop_accent() {
@@ -546,24 +547,31 @@ rpm_needs_reboot() {
     return 1
 }
 
-# ask_shutdown: asks whether to shut down, counting down from SHUTDOWN_COUNTDOWN.
-# Only "y" means yes. Any other key, or no answer before the countdown ends, is no.
-ask_shutdown() {
-    local left key=""
-    # Throw away anything typed during the update, so a stray key can't answer.
+# ask_restart: asks whether to restart, counting down from RESTART_COUNTDOWN.
+# Only y or Y followed by Enter means yes, so a command you're already typing for
+# your shell can't answer it by accident. Anything else, Ctrl+C, or no answer
+# before the countdown ends means no. What you type is shown after the question.
+ask_restart() {
+    local deadline=$(( SECONDS + RESTART_COUNTDOWN )) answer="" key entered=0
+    # Throw away anything typed during the update.
     while read -r -s -n 1 -t 0.05 _; do :; done
     printf '\e[?25h'   # show the cursor while waiting for an answer
     echo
-    for (( left = SHUTDOWN_COUNTDOWN; left > 0; left-- )); do
-        printf '\r\e[K  %sShut down now?%s [y/N] %s(no in %ds)%s ' "$BOLD" "$RESET" "$DIM" "$left" "$RESET"
-        if read -r -s -n 1 -t 1 key; then break; fi
-        check_interrupt
+    while (( SECONDS < deadline && ! INTERRUPTED )); do
+        printf '\r\e[K  %sRestart now?%s [y/N] %s(no in %ds)%s %s' \
+            "$BOLD" "$RESET" "$DIM" $(( deadline - SECONDS )) "$RESET" "$answer"
+        if ! read -r -s -n 1 -t 1 key; then continue; fi   # no key this second
+        case $key in
+            '')            entered=1; break ;;              # Enter
+            $'\x7f'|$'\b') answer=${answer%?} ;;           # Backspace
+            *)             answer+=$key ;;
+        esac
     done
-    if [[ $key == [yY] ]]; then
-        printf '\r\e[K  Shutting down...\n'
+    if (( entered && ! INTERRUPTED )) && [[ $answer == [yY] ]]; then
+        printf '\r\e[K  Restarting...\n'
         return 0
     fi
-    printf '\r\e[K  %sNot shutting down.%s\n' "$DIM" "$RESET"
+    printf '\r\e[K  %sNot restarting.%s\n' "$DIM" "$RESET"
     return 1
 }
 
@@ -644,7 +652,9 @@ fi
 check_interrupt
 
 echo
+restart_needed=0
 if reboot_needed; then
+    restart_needed=1
     printf '  %s! A reboot is required to finish the update.%s\n' "$YELLOW" "$RESET"
 fi
 elapsed total "$TOTAL_START"
@@ -656,11 +666,12 @@ else
     echo "All done in $total."
 fi
 
-# On Fedora, offer to shut down (only when someone is at the terminal to answer).
-shut_down=0
-if (( FEDORA && SHUTDOWN_COUNTDOWN > 0 )) && [[ -t 0 && -t 1 ]]; then
-    if ask_shutdown; then shut_down=1; fi
+# On Fedora, when a restart is needed, offer one (only when someone is at the
+# terminal to answer).
+restart=0
+if (( FEDORA && restart_needed && RESTART_COUNTDOWN > 0 )) && [[ -t 0 && -t 1 ]]; then
+    if ask_restart; then restart=1; fi
 fi
 
 rm -rf "$LOG_DIR"
-if (( shut_down )); then systemctl poweroff; fi
+if (( restart && ! INTERRUPTED )); then systemctl reboot; fi   # Ctrl+C at any point means no
