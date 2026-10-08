@@ -9,6 +9,10 @@ set -euo pipefail
 # Or force one of the theme's colors: 1 red, 2 green, 3 yellow, 4 blue, 5 magenta, 6 cyan.
 ACCENT=auto
 
+# Fedora only: when it's done, ask whether to shut down, waiting this many
+# seconds for an answer. No answer means no. 0 turns the question off.
+SHUTDOWN_COUNTDOWN=30
+
 # Prints the desktop accent as "R;G;B" if the current Ptyxis palette follows it.
 desktop_accent() {
     local palette
@@ -105,6 +109,7 @@ INTRO_SHOWN=0
 INTERRUPTED=0
 WIDE_WARNINGS=0
 BREW_REJECTED=""
+FEDORA=0
 
 # The animations run alongside the update, so they avoid starting new processes
 # (each one costs several milliseconds of CPU) and use bash built-ins instead.
@@ -541,6 +546,27 @@ rpm_needs_reboot() {
     return 1
 }
 
+# ask_shutdown: asks whether to shut down, counting down from SHUTDOWN_COUNTDOWN.
+# Only "y" means yes. Any other key, or no answer before the countdown ends, is no.
+ask_shutdown() {
+    local left key=""
+    # Throw away anything typed during the update, so a stray key can't answer.
+    while read -r -s -n 1 -t 0.05 _; do :; done
+    printf '\e[?25h'   # show the cursor while waiting for an answer
+    echo
+    for (( left = SHUTDOWN_COUNTDOWN; left > 0; left-- )); do
+        printf '\r\e[K  %sShut down now?%s [y/N] %s(no in %ds)%s ' "$BOLD" "$RESET" "$DIM" "$left" "$RESET"
+        if read -r -s -n 1 -t 1 key; then break; fi
+        check_interrupt
+    done
+    if [[ $key == [yY] ]]; then
+        printf '\r\e[K  Shutting down...\n'
+        return 0
+    fi
+    printf '\r\e[K  %sNot shutting down.%s\n' "$DIM" "$RESET"
+    return 1
+}
+
 reboot_needed() {
     if [[ -f /var/run/reboot-required || -e /run/ostree/staged-deployment ]]; then return 0; fi
     have rpm && have dnf && rpm_needs_reboot
@@ -550,6 +576,7 @@ TOTAL_START=$SECONDS
 
 # The system's own packages.
 if [[ -e /run/ostree-booted ]] && have rpm-ostree; then
+    FEDORA=1
     run_step "Upgrading the system image" upgrade_system_image
     detail "$(tail -n 1 "$LAST_LOG")"
 elif have apt-get && [[ -e /etc/debian_version ]]; then   # Fedora can install apt too
@@ -559,6 +586,7 @@ elif have apt-get && [[ -e /etc/debian_version ]]; then   # Fedora can install a
     summary=$(grep -m1 -E '^[0-9]+ upgraded' "$LAST_LOG") || true
     detail "${summary%.}"
 elif have dnf; then
+    FEDORA=1
     run_step "Refreshing package lists" line_buffered dnf -y makecache --refresh
     run_step "Upgrading packages" line_buffered dnf -y upgrade
     detail "$(dnf_summary "$LAST_LOG")"
@@ -628,4 +656,11 @@ else
     echo "All done in $total."
 fi
 
+# On Fedora, offer to shut down (only when someone is at the terminal to answer).
+shut_down=0
+if (( FEDORA && SHUTDOWN_COUNTDOWN > 0 )) && [[ -t 0 && -t 1 ]]; then
+    if ask_shutdown; then shut_down=1; fi
+fi
+
 rm -rf "$LOG_DIR"
+if (( shut_down )); then systemctl poweroff; fi
