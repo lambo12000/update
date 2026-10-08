@@ -560,11 +560,16 @@ ask_restart() {
     while (( SECONDS < deadline && ! INTERRUPTED )); do
         printf '\r\e[K  %sRestart now?%s [y/N] %s(no in %ds)%s %s' \
             "$BOLD" "$RESET" "$DIM" $(( deadline - SECONDS )) "$RESET" "$answer"
-        if ! read -r -s -n 1 -t 1 key; then continue; fi   # no key this second
+        # IFS= keeps a space or tab from being read as an empty key (Enter).
+        IFS= read -r -s -n 1 -t 1 key || {
+            if (( $? > 128 )); then continue; fi   # no key this second
+            break                                  # end of input
+        }
         case $key in
             '')            entered=1; break ;;              # Enter
             $'\x7f'|$'\b') answer=${answer%?} ;;           # Backspace
-            *)             answer+=$key ;;
+            [[:print:]])   answer+=$key ;;
+            *)             answer+='?' ;;                   # Tab, arrows...: not y
         esac
     done
     if (( entered && ! INTERRUPTED )) && [[ $answer == [yY] ]]; then
@@ -666,12 +671,12 @@ else
     echo "All done in $total."
 fi
 
-# On Fedora, when a restart is needed, offer one (only when someone is at the
-# terminal to answer).
-restart=0
-if (( FEDORA && restart_needed && RESTART_COUNTDOWN > 0 )) && [[ -t 0 && -t 1 ]]; then
-    if ask_restart; then restart=1; fi
-fi
-
 rm -rf "$LOG_DIR"
-if (( restart && ! INTERRUPTED )); then systemctl reboot; fi   # Ctrl+C at any point means no
+
+# On Fedora, when a restart is needed, offer one (only when someone is at the
+# terminal to answer). Ctrl+C at any point means no.
+if (( FEDORA && restart_needed && RESTART_COUNTDOWN > 0 )) && [[ -t 0 && -t 1 ]] &&
+    ask_restart && (( ! INTERRUPTED )); then
+    systemctl reboot
+fi
+if (( INTERRUPTED )); then exit 130; fi
